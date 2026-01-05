@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator
 
 class Operator(models.Model):
     """
@@ -135,7 +135,7 @@ class MonthlyConsumption(models.Model):
         related_name='consumption_history'
     )
     year = models.IntegerField('Год', validators=[MinValueValidator(2020)])
-    month = models.IntegerField('Месяц', validators=[MinValueValidator(1), models.MaxValueValidator(12)])
+    month = models.IntegerField('Месяц', validators=[MinValueValidator(1), MaxValueValidator(12)])
     actual_data_used = models.FloatField(
         'Фактический расход ГБ',
         validators=[MinValueValidator(0)]
