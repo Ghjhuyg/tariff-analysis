@@ -1,0 +1,319 @@
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+from django.db import transaction
+from comparison.models import Operator, TariffPlan
+import requests
+from bs4 import BeautifulSoup
+import re
+from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
+
+class Command(BaseCommand):
+    help = 'Парсит тарифы с сайтов операторов и сохраняет в TariffPlan'
+    
+    def add_arguments(self, parser):
+        parser.add_argument(
+            '--operator',
+            type=str,
+            help='Парсить только конкретного оператора (mts, megafon, beeline, t2)',
+        )
+        parser.add_argument(
+            '--force',
+            action='store_true',
+            help='Принудительный парсинг даже если данные свежие',
+        )
+        parser.add_argument(
+            '--dry-run',
+            action='store_true',
+            help='Тестовый режим без сохранения в БД',
+        )
+        parser.add_argument(
+            '--clear',
+            action='store_true',
+            help='Очистить старые тарифы перед парсингом',
+        )
+    
+    def handle(self, *args, **options):
+        # Получаем всех операторов
+        operators = Operator.objects.all()
+        
+        if options['operator']:
+            operators = operators.filter(name__icontains=options['operator'])
+        
+        if options['clear']:
+            self.stdout.write('🧹 Очищаем старые тарифы...')
+            TariffPlan.objects.all().delete()
+        
+        self.stdout.write(f'Начинаем парсинг для {operators.count()} операторов...')
+        
+        total_parsed = 0
+        for operator in operators:
+            try:
+                tariffs_count = self.parse_and_save_operator(operator, options)
+                total_parsed += tariffs_count
+                
+                if options['dry_run']:
+                    self.stdout.write(self.style.WARNING(
+                        f'🧪 {operator.name}: найдено {tariffs_count} тарифов (режим теста)'
+                    ))
+                else:
+                    self.stdout.write(self.style.SUCCESS(
+                        f'✅ {operator.name}: сохранено {tariffs_count} тарифов'
+                    ))
+                    
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f'❌ Ошибка при парсинге {operator.name}: {e}'))
+                logger.exception(f"Error parsing {operator.name}")
+        
+        self.stdout.write(f'\n🎯 ИТОГО: обработано {total_parsed} тарифов')
+    
+    @transaction.atomic
+    def parse_and_save_operator(self, operator, options):
+        """Парсит и сохраняет тарифы оператора"""
+        tariffs_data = self.parse_operator(operator)
+        
+        if options['dry_run']:
+            return len(tariffs_data)
+        
+        saved_count = 0
+        for tariff_data in tariffs_data:
+            try:
+                # Создаем или обновляем тариф
+                tariff, created = TariffPlan.objects.update_or_create(
+                    operator=operator,
+                    name=tariff_data['name'],
+                    defaults={
+                        'description': tariff_data.get('description', ''),
+                        'monthly_fee': tariff_data['monthly_fee'],
+                        'data_volume': tariff_data.get('data_volume', 0),
+                        'minutes_volume': tariff_data.get('minutes_volume', 0),
+                        'overage_data_price': tariff_data.get('overage_data_price', 0),
+                        'overage_minute_price': tariff_data.get('overage_minute_price', 0),
+                        'is_archived': tariff_data.get('is_archived', False),
+                    }
+                )
+                saved_count += 1
+                
+                if created:
+                    self.stdout.write(f'   ➕ Создан: {tariff.name}')
+                else:
+                    self.stdout.write(f'   🔄 Обновлен: {tariff.name}')
+                    
+            except Exception as e:
+                self.stdout.write(f'   ⚠️ Ошибка сохранения тарифа: {e}')
+        
+        return saved_count
+    
+    def parse_operator(self, operator):
+        """Парсит сайт оператора и возвращает данные для TariffPlan"""
+        tariffs = []
+        
+        if 'мтс' in operator.name.lower():
+            tariffs = self.parse_mts(operator.website)
+        elif 'мегафон' in operator.name.lower():
+            tariffs = self.parse_megafon(operator.website)
+        elif 'билайн' in operator.name.lower():
+            tariffs = self.parse_beeline(operator.website)
+        elif 'т2' in operator.name.lower() or 'tele2' in operator.name.lower():
+            tariffs = self.parse_t2(operator.website)
+        
+        return tariffs
+    
+    def extract_price(self, text):
+        """Извлекает число из текста с ценой"""
+        # Ищем числа с десятичными разделителями
+        match = re.search(r'(\d+[\s,.]?\d*[\s,.]?\d*)', str(text))
+        if match:
+            # Заменяем запятые на точки и убираем пробелы
+            price_str = match.group(1).replace(',', '.').replace(' ', '')
+            try:
+                return Decimal(price_str)
+            except:
+                return Decimal(0)
+        return Decimal(0)
+    
+    def extract_data_gb(self, text):
+        """Извлекает объем данных в ГБ"""
+        # Ищем числа с указанием ГБ, GB, Гб
+        text_lower = str(text).lower()
+        
+        # Паттерны для поиска
+        patterns = [
+            r'(\d+[\s,.]?\d*)\s*(?:гб|gb|гигабайт)',
+            r'(\d+)\s*gb',
+            r'безлимит',
+            r'неограничен'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if 'безлимит' in text_lower or 'неограничен' in text_lower:
+                    return 999999  # Очень большое число для безлимита
+                try:
+                    return float(match.group(1).replace(',', '.'))
+                except:
+                    continue
+        
+        return 0.0
+    
+    def extract_minutes(self, text):
+        """Извлекает количество минут"""
+        text_lower = str(text).lower()
+        
+        patterns = [
+            r'(\d+)\s*(?:минут|мин|min)',
+            r'(\d+)\s*min',
+            r'безлимит',
+            r'неограничен'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if 'безлимит' in text_lower or 'неограничен' in text_lower:
+                    return 999999
+                try:
+                    return int(match.group(1))
+                except:
+                    continue
+        
+        return 0
+    
+    # Пример парсеров для каждого оператора
+    def parse_mts(self, url):
+        """Парсер для МТС"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            tariffs = []
+            
+            # Заглушка с тестовыми данными
+            tariffs = [
+                {
+                    'name': 'МТС Smart',
+                    'description': 'Базовый тариф с интернетом и минутами',
+                    'monthly_fee': self.extract_price('300 ₽/мес'),
+                    'data_volume': self.extract_data_gb('10 ГБ'),
+                    'minutes_volume': self.extract_minutes('300 минут'),
+                    'overage_data_price': self.extract_price('100 руб/ГБ'),
+                    'overage_minute_price': self.extract_price('2 руб/мин'),
+                    'is_archived': False,
+                },
+                {
+                    'name': 'МТС Premium',
+                    'description': 'Премиум тариф с безлимитным интернетом',
+                    'monthly_fee': self.extract_price('700 ₽/мес'),
+                    'data_volume': self.extract_data_gb('безлимит'),
+                    'minutes_volume': self.extract_minutes('1000 минут'),
+                    'overage_data_price': self.extract_price('0'),
+                    'overage_minute_price': self.extract_price('1.5 руб/мин'),
+                    'is_archived': False,
+                },
+            ]
+            
+            return tariffs
+            
+        except Exception as e:
+            self.stdout.write(f'Ошибка парсинга МТС: {e}')
+            return []
+    
+    def parse_megafon(self, url):
+        """Парсер для Мегафон"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            tariffs = []
+            
+            # Заглушка с тестовыми данными
+            tariffs = [
+            {
+                'name': 'Мегафон Включайся!',
+                'description': 'Тариф с пакетом интернета',
+                'monthly_fee': self.extract_price('400 ₽'),
+                'data_volume': self.extract_data_gb('15 ГБ'),
+                'minutes_volume': self.extract_minutes('500 минут'),
+                'overage_data_price': self.extract_price('150 руб/ГБ'),
+                'overage_minute_price': self.extract_price('3 руб/мин'),
+                'is_archived': False,
+            },
+            ]
+            
+            return tariffs
+            
+        except Exception as e:
+            self.stdout.write(f'Ошибка парсинга МегаФон: {e}')
+            return []
+
+    
+    def parse_beeline(self, url):
+        """Парсер для Билайн"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            tariffs = []
+            
+            # Заглушка с тестовыми данными
+            tariffs = [
+            {
+                'name': 'Билайн Всё за 600',
+                'description': 'Комплексный тариф',
+                'monthly_fee': self.extract_price('600 ₽'),
+                'data_volume': self.extract_data_gb('20 ГБ'),
+                'minutes_volume': self.extract_minutes('безлимит'),
+                'overage_data_price': self.extract_price('120 руб/ГБ'),
+                'overage_minute_price': self.extract_price('0'),
+                'is_archived': False,
+            },
+            ]
+            
+            return tariffs
+            
+        except Exception as e:
+            self.stdout.write(f'Ошибка парсинга Билайн: {e}')
+            return []
+    
+    def parse_t2(self, url):
+        """Парсер для Т2 (Tele2)"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            tariffs = []
+            
+            # Заглушка с тестовыми данными
+            tariffs = [
+            {
+                'name': 'Т2 Мой Онлайн',
+                'description': 'Популярный тариф Tele2',
+                'monthly_fee': self.extract_price('350 ₽'),
+                'data_volume': self.extract_data_gb('12 ГБ'),
+                'minutes_volume': self.extract_minutes('400 минут'),
+                'overage_data_price': self.extract_price('80 руб/ГБ'),
+                'overage_minute_price': self.extract_price('2.5 руб/мин'),
+                'is_archived': False,
+            },
+            ]
+            
+            return tariffs
+            
+        except Exception as e:
+            self.stdout.write(f'Ошибка парсинга Т2: {e}')
+            return []
