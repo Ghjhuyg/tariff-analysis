@@ -7,7 +7,7 @@ class Operator(models.Model):
     Оператор связи (МТС, МегаФон, Билайн и т.д.)
     """
     name = models.CharField('Название оператора', max_length=100, unique=True)
-    logo = models.ImageField('Логотип', upload_to='operators/logo/', blank=True, null=True)
+    logo = models.CharField('Путь до логотипа', max_length=100, blank=True)
     website = models.URLField('Сайт для парсинга', max_length=200)
     color = models.CharField('Брендовый цвет', max_length=7, default='#007bff', 
                             help_text='HEX-код цвета, например, #ff0000 для красного')
@@ -19,6 +19,29 @@ class Operator(models.Model):
 
     def __str__(self):
         return self.name
+    
+    @property
+    def logo_url(self):
+        """Генерируем URL до логотипа"""
+        if self.logo:
+            return f'/static/comparison/operators_logo/{self.logo}'
+        return None
+    
+    @property
+    def logo_path(self):
+        """Полный путь к файлу"""
+        import os
+        from django.conf import settings
+        if self.logo:
+            return os.path.join(
+                settings.BASE_DIR,
+                'comparison',
+                'static',
+                'comparison',
+                'operators_logo',
+                self.logo
+            )
+        return None
 
 
 class TariffPlan(models.Model):
