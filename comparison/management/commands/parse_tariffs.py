@@ -134,23 +134,22 @@ class Command(BaseCommand):
                 return Decimal(0)
         return Decimal(0)
     
-    def extract_data_gb(self, text):
+    def extract_data_gb(text):
         """Извлекает объем данных в ГБ"""
         # Ищем числа с указанием ГБ, GB, Гб
         text_lower = str(text).lower()
         
         # Паттерны для поиска
         patterns = [
-            r'(\d+[\s,.]?\d*)\s*(?:гб|gb|гигабайт)',
-            r'(\d+)\s*gb',
-            r'безлимит',
+            r'безлимит гб',
             r'неограничен'
+            r'(\d+[\s,.]?\d*)\s*(?:гб|gb|гигабайт)',
+            r'(\d+)\s*гб'
         ]
-        
         for pattern in patterns:
             match = re.search(pattern, text_lower)
             if match:
-                if 'безлимит' in text_lower or 'неограничен' in text_lower:
+                if 'безлимит гб' in text_lower or 'неограничен' in text_lower:
                     return 999999  # Очень большое число для безлимита
                 try:
                     return float(match.group(1).replace(',', '.'))
@@ -159,21 +158,21 @@ class Command(BaseCommand):
         
         return 0.0
     
-    def extract_minutes(self, text):
+    def extract_minutes(text):
         """Извлекает количество минут"""
         text_lower = str(text).lower()
         
         patterns = [
             r'(\d+)\s*(?:минут|мин|min)',
-            r'(\d+)\s*min',
-            r'безлимит',
+            r'(\d+)\s*мин',
+            r'безлимит минут',
             r'неограничен'
         ]
         
         for pattern in patterns:
             match = re.search(pattern, text_lower)
             if match:
-                if 'безлимит' in text_lower or 'неограничен' in text_lower:
+                if 'безлимит минут' in text_lower or 'неограничен' in text_lower:
                     return 999999
                 try:
                     return int(match.group(1))
@@ -186,38 +185,34 @@ class Command(BaseCommand):
     def parse_mts(self, url):
         """Парсер для МТС"""
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, timeout=10, verify=False)
             soup = BeautifulSoup(response.content, 'html.parser')
-            
+
+            keys=[
+                'name',
+                'operator'
+                'description', 
+                'monthly_fee', 
+                'data_volume', 
+                'minutes_volume', 
+                'overage_data_price', 
+                'overage_minute_price', 
+                'is_archived'
+                ]
+
             tariffs = []
             
-            # Заглушка с тестовыми данными
-            tariffs = [
-                {
-                    'name': 'МТС Smart',
-                    'description': 'Базовый тариф с интернетом и минутами',
-                    'monthly_fee': self.extract_price('300 ₽/мес'),
-                    'data_volume': self.extract_data_gb('10 ГБ'),
-                    'minutes_volume': self.extract_minutes('300 минут'),
-                    'overage_data_price': self.extract_price('100 руб/ГБ'),
-                    'overage_minute_price': self.extract_price('2 руб/мин'),
-                    'is_archived': False,
-                },
-                {
-                    'name': 'МТС Premium',
-                    'description': 'Премиум тариф с безлимитным интернетом',
-                    'monthly_fee': self.extract_price('700 ₽/мес'),
-                    'data_volume': self.extract_data_gb('безлимит'),
-                    'minutes_volume': self.extract_minutes('1000 минут'),
-                    'overage_data_price': self.extract_price('0'),
-                    'overage_minute_price': self.extract_price('1.5 руб/мин'),
-                    'is_archived': False,
-                },
-            ]
-            
+            cards = soup.find_all("div", class_=["card"])
+            for card in cards:
+                tariff = {}
+                tariff['name'] = card.find("a", "card-title__link").contents[0]
+                tariff['description'] = str(card.find("div", "card-description card-description__margin card-element_margin-bottom").contents[0]).replace('\xa0', ' ')
+                tariff['monthly_fee'] = int(card.find("span", "price-text").contents[0])
+                data_and_minutes = str(card.find("ul", "features features__margin features__padding")).replace('&nbsp;', ' ')
+                tariff['data_volume'] = extract_data_gb(data_and_minutes)
+                tariff['minutes_volume'] = extract_minutes(data_and_minutes)
+                tariff['is_archived'] = False
+
             return tariffs
             
         except Exception as e:

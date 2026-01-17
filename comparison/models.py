@@ -72,20 +72,6 @@ class TariffPlan(models.Model):
         default=0,
         validators=[MinValueValidator(0)]
     )
-    overage_data_price = models.DecimalField(
-        'Цена за дополнительный ГБ',
-        max_digits=10,
-        decimal_places=2,
-        default=0,
-        validators=[MinValueValidator(0)]
-    )
-    overage_minute_price = models.DecimalField(
-        'Цена за дополнительную минуту',
-        max_digits=10,
-        decimal_places=2,
-        default=0,
-        validators=[MinValueValidator(0)]
-    )
     is_archived = models.BooleanField(
         'Архивный тариф',
         default=False,
@@ -100,16 +86,6 @@ class TariffPlan(models.Model):
 
     def __str__(self):
         return f'{self.operator.name} - {self.name}'
-
-    def calculate_cost_for_user(self, data_gb, minutes):
-        """
-        Рассчитывает стоимость тарифа для пользователя с заданным потреблением
-        """
-        base_cost = self.monthly_fee
-        extra_data = max(0, data_gb - self.data_volume)
-        extra_minutes = max(0, minutes - self.minutes_volume)
-        total_cost = base_cost + (extra_data * self.overage_data_price) + (extra_minutes * self.overage_minute_price)
-        return total_cost
 
 
 class UserProfile(models.Model):
